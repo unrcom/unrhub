@@ -1,436 +1,517 @@
 // ============================================================================
 // Edge Function: evaluate-and-match
-// Purpose: 案件評価とマッチング実行
+// Purpose: Evaluate project requirements and match with developers
 // ============================================================================
 
 // ----------------------------------------------------------------------------
 // Section 1: Imports and Type Definitions
 // ----------------------------------------------------------------------------
+
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
-// AWS SDK v3 のインポートを削除（Deno環境で動作しないため）
-// 代わりにfetch APIで直接Bedrock APIを呼び出す
+import {
+  BedrockRuntimeClient,
+  InvokeModelCommand,
+} from "https://esm.sh/@aws-sdk/client-bedrock-runtime@3.451.0";
 
-interface ProjectData {
-  title?: string;
-  description?: string;
-  project_type?: string;
-  duration_months?: number;
-  industry?: string;
+interface SkillRequirement {
+  skill_name: string;
+  minimum_level: "beginner" | "intermediate" | "advanced" | "expert";
 }
 
-interface ChatMessage {
-  role: string;
+interface ProjectInput {
+  title: string;
+  project_type: string[];
+  project_type_other?: string;
+  required_skills: SkillRequirement[];
+  required_skills_other?: string;
+  preferred_skills?: SkillRequirement[];
+  preferred_skills_other?: string;
+  start_date: string;
+  end_date: string;
+  additional_requirements?: string;
+}
+
+interface InitialRequest {
+  project: ProjectInput;
+}
+
+interface ChatRequest {
+  project_id: string;
   message: string;
 }
 
-interface SkillRequirement {
-  name: string;
-  level: string;
-  required: boolean;
+type RequestPayload = InitialRequest | ChatRequest;
+
+interface QuestionResponse {
+  project_id: string;
+  type: "question";
+  message: string;
 }
 
-interface Requirements {
-  skills: SkillRequirement[];
-  start_date: string;
+interface MatchResponse {
+  project_id: string;
+  type: "matches";
+  matches: Array<{
+    developer_id: string;
+    name: string;
+    match_score: number;
+    matched_skills: string[];
+    reasoning: string;
+  }>;
 }
 
-interface Evaluation {
-  ready: boolean;
-  question?: string;
-  requirements?: Requirements;
+type ResponsePayload = QuestionResponse | MatchResponse;
+
+interface LLMEvaluationResult {
+  is_sufficient: boolean;
+  missing_info?: string[];
+  questions?: string[];
+  next_question?: string;
 }
 
 // ----------------------------------------------------------------------------
 // Section 2: CORS Configuration
 // ----------------------------------------------------------------------------
-const corsHeaders = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  "Access-Control-Allow-Headers": "authorization, content-type",
 };
+
+function handleCORS(req: Request): Response | null {
+  if (req.method === "OPTIONS") {
+    return new Response(null, { headers: CORS_HEADERS });
+  }
+  return null;
+}
 
 // ----------------------------------------------------------------------------
 // Section 3: Main Request Handler
 // ----------------------------------------------------------------------------
+
 serve(async (req) => {
-  // CORS preflight
-  if (req.method === 'OPTIONS') {
-    return new Response('ok', { headers: corsHeaders });
-  }
-
   try {
-    // Parse request body
-    const { project, chatHistory, message } = await req.json();
+    // Handle CORS preflight
+    const corsResponse = handleCORS(req);
+    if (corsResponse) return corsResponse;
 
-    // Build prompts
-    const systemPrompt = buildSystemPrompt();
-    const userPrompt = buildUserPrompt(project, chatHistory || [], message);
+    // Parse request
+    const payload: RequestPayload = await req.json();
 
-    // Call Claude via Bedrock (using fetch API)
-    const evaluation = await callClaudeForEvaluation(systemPrompt, userPrompt);
+    // Initialize clients
+    const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
+    const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+    const supabase = createClient(supabaseUrl, supabaseKey);
 
-    // Handle response
-    if (evaluation.ready) {
-      // Ready to match - execute matching
-      const supabaseClient = createClient(
-        Deno.env.get('SUPABASE_URL') ?? '',
-        Deno.env.get('SUPABASE_ANON_KEY') ?? '',
-      );
-      
-      const matches = await matchDevelopers(supabaseClient, evaluation.requirements!);
-      
-      return new Response(
-        JSON.stringify({ 
-          type: 'matches', 
-          data: matches,
-          requirements: evaluation.requirements
-        }),
-        { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
+    const bedrockClient = new BedrockRuntimeClient({
+      region: Deno.env.get("AWS_REGION") || "ap-northeast-1",
+      credentials: {
+        accessKeyId: Deno.env.get("AWS_ACCESS_KEY_ID")!,
+        secretAccessKey: Deno.env.get("AWS_SECRET_ACCESS_KEY")!,
+      },
+    });
+
+    let response: ResponsePayload;
+
+    // Route to appropriate handler
+    if (isInitialRequest(payload)) {
+      response = await handleInitialRequest(payload, supabase, bedrockClient);
+    } else if (isChatRequest(payload)) {
+      response = await handleChatRequest(payload, supabase, bedrockClient);
     } else {
-      // Need more information - return question
-      return new Response(
-        JSON.stringify({ 
-          type: 'question', 
-          message: evaluation.question,
-          chatHistory: [...(chatHistory || []), 
-            { role: 'assistant', message: evaluation.question }
-          ]
-        }),
-        { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
+      throw new Error("Invalid request format");
     }
 
+    return new Response(JSON.stringify(response), {
+      headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+    });
   } catch (error) {
-    console.error('Error:', error);
-    return new Response(
-      JSON.stringify({ error: error.message }),
-      { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    );
+    console.error("Error:", error);
+    return new Response(JSON.stringify({ error: error.message }), {
+      status: 500,
+      headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+    });
   }
 });
+
+function isInitialRequest(payload: any): payload is InitialRequest {
+  return payload.project && !payload.project_id;
+}
+
+function isChatRequest(payload: any): payload is ChatRequest {
+  return payload.project_id && payload.message;
+}
+
+async function handleInitialRequest(
+  payload: InitialRequest,
+  supabase: any,
+  bedrockClient: BedrockRuntimeClient
+): Promise<ResponsePayload> {
+  console.log("Processing initial request");
+  const { project } = payload;
+
+  // Save project to database
+  const { data: projectData, error: projectError } = await supabase
+    .from("projects")
+    .insert({
+      title: project.title,
+      description: `${project.title}\n${project.additional_requirements || ""}`,
+      project_type: project.project_type,
+      start_date: project.start_date,
+      end_date: project.end_date,
+      status: "draft",
+    })
+    .select()
+    .single();
+
+  if (projectError) {
+    throw new Error(`Failed to create project: ${projectError.message}`);
+  }
+
+  const projectId = projectData.id;
+
+  // Save required skills
+  if (project.required_skills && project.required_skills.length > 0) {
+    await saveSkills(supabase, projectId, project.required_skills, true);
+  }
+
+  // Save preferred skills
+  if (project.preferred_skills && project.preferred_skills.length > 0) {
+    await saveSkills(supabase, projectId, project.preferred_skills, false);
+  }
+
+  // Evaluate with LLM
+  const systemPrompt = buildSystemPrompt();
+  const userPrompt = buildInitialUserPrompt(project);
+
+  const llmResponse = await callClaude(bedrockClient, [
+    { role: "user", content: userPrompt },
+  ], systemPrompt);
+
+  console.log("LLM Response:", llmResponse);
+
+  const evaluation = parseEvaluationResponse(llmResponse);
+
+  // Save chat history
+  await supabase.from("project_chat_history").insert({
+    project_id: projectId,
+    role: "system",
+    message: userPrompt,
+  });
+
+  if (!evaluation.is_sufficient) {
+    await supabase.from("project_chat_history").insert({
+      project_id: projectId,
+      role: "assistant",
+      message: evaluation.next_question || "追加情報を教えてください。",
+    });
+
+    return {
+      project_id: projectId,
+      type: "question",
+      message: evaluation.next_question || "追加情報を教えてください。",
+    };
+  } else {
+    const matches = await performMatching(supabase, projectId, project);
+    return {
+      project_id: projectId,
+      type: "matches",
+      matches,
+    };
+  }
+}
+
+async function handleChatRequest(
+  payload: ChatRequest,
+  supabase: any,
+  bedrockClient: BedrockRuntimeClient
+): Promise<ResponsePayload> {
+  console.log("Processing chat request");
+  const { project_id, message } = payload;
+
+  // Get project data
+  const { data: projectData, error: projectError } = await supabase
+    .from("projects")
+    .select("*, project_required_skills(*)")
+    .eq("id", project_id)
+    .single();
+
+  if (projectError || !projectData) {
+    throw new Error("Project not found");
+  }
+
+  // Get chat history
+  const { data: chatHistory } = await supabase
+    .from("project_chat_history")
+    .select("*")
+    .eq("project_id", project_id)
+    .order("created_at", { ascending: true });
+
+  // Save user message
+  await supabase.from("project_chat_history").insert({
+    project_id: project_id,
+    role: "user",
+    message: message,
+  });
+
+  // Evaluate with LLM
+  const systemPrompt = buildSystemPrompt();
+  const messages = (chatHistory || []).map((chat) => ({
+    role: chat.role === "assistant" ? "assistant" : "user",
+    content: chat.message,
+  }));
+  messages.push({ role: "user", content: message });
+
+  const llmResponse = await callClaude(bedrockClient, messages, systemPrompt);
+  console.log("LLM Response:", llmResponse);
+
+  const evaluation = parseEvaluationResponse(llmResponse);
+
+  if (!evaluation.is_sufficient) {
+    await supabase.from("project_chat_history").insert({
+      project_id: project_id,
+      role: "assistant",
+      message: evaluation.next_question || "追加情報を教えてください。",
+    });
+
+    return {
+      project_id: project_id,
+      type: "question",
+      message: evaluation.next_question || "追加情報を教えてください。",
+    };
+  } else {
+    const matches = await performMatching(supabase, project_id, projectData);
+    return {
+      project_id: project_id,
+      type: "matches",
+      matches,
+    };
+  }
+}
+
+async function saveSkills(
+  supabase: any,
+  projectId: string,
+  skills: SkillRequirement[],
+  isRequired: boolean
+): Promise<void> {
+  const skillsToInsert = skills.map((skill) => ({
+    project_id: projectId,
+    skill_name: skill.skill_name,
+    minimum_level: skill.minimum_level,
+    is_required: isRequired,
+  }));
+
+  const { error } = await supabase
+    .from("project_required_skills")
+    .insert(skillsToInsert);
+
+  if (error) {
+    console.error(`Failed to insert ${isRequired ? "required" : "preferred"} skills:`, error);
+  }
+}
 
 // ----------------------------------------------------------------------------
 // Section 4: System Prompt Builder
 // ----------------------------------------------------------------------------
+
 function buildSystemPrompt(): string {
   return `あなたは技術者マッチングの専門家です。
+クライアントから提供された案件情報を評価し、技術者をマッチングするために十分な情報があるか判断してください。
 
-【役割】
-クライアントの案件情報から、適切な技術者をマッチングするために必要な情報を収集します。
+以下の情報が揃っていれば「十分」と判断してください：
+- 案件タイトル
+- 案件タイプ
+- 必須スキル
+- 開始日・終了日
+- 予算または稼働条件の目安
 
-【マッチングに必要な情報】
-1. 必要な技術スタック（プログラミング言語、フレームワーク等）
-2. 各技術の経験レベル（beginner, intermediate, advanced, expert）
-3. 開始時期（now, または具体的な日付 yyyy-mm-dd）
+情報が不足している場合は、クライアントに追加で質問してください。
+質問は1つずつ、自然な日本語で行ってください。
 
-【原則】
-- 最小限の質問で情報を収集してください
-- 技術者選定に直接関係ない質問はしないでください
-- 十分な情報が揃ったら、マッチングを実行してください
-
-【出力形式】
-以下のJSON形式で返してください：
-\`\`\`json
+レスポンスは以下のJSON形式で返してください：
 {
-  "ready": true/false,
-  "question": "質問文（readyがfalseの場合）",
-  "requirements": {
-    "skills": [
-      {"name": "Python", "level": "intermediate", "required": true},
-      {"name": "Django", "level": "beginner", "required": false}
-    ],
-    "start_date": "now" または "2025-12-01"
-  }
-}
-\`\`\``;
+  "is_sufficient": true/false,
+  "next_question": "質問文"（is_sufficientがfalseの場合のみ）
+}`;
 }
 
 // ----------------------------------------------------------------------------
 // Section 5: User Prompt Builder
 // ----------------------------------------------------------------------------
-function buildUserPrompt(project: ProjectData, chatHistory: ChatMessage[], message: string): string {
-  let prompt = `【案件情報】
-タイトル: ${project.title || '未設定'}
-概要: ${project.description || '未設定'}
-案件タイプ: ${project.project_type || '未設定'}
-期間: ${project.duration_months ? project.duration_months + 'ヶ月' : '未設定'}
-業界: ${project.industry || '未設定'}
 
-`;
+function buildInitialUserPrompt(project: ProjectInput): string {
+  return `以下の案件情報を評価してください：
 
-  if (chatHistory.length > 0) {
-    prompt += `【これまでの会話】\n`;
-    chatHistory.forEach((chat) => {
-      prompt += `${chat.role}: ${chat.message}\n`;
-    });
-  }
-
-  if (message) {
-    prompt += `\n【クライアントの最新メッセージ】\n${message}\n`;
-  }
-
-  prompt += `\n上記の情報から、マッチングに必要な情報が揃っているか判断してください。`;
-
-  return prompt;
+案件タイトル: ${project.title}
+案件タイプ: ${project.project_type.join(", ")}
+必須スキル: ${project.required_skills.map((s) => `${s.skill_name}(${s.minimum_level})`).join(", ")}
+優先スキル: ${project.preferred_skills?.map((s) => `${s.skill_name}(${s.minimum_level})`).join(", ") || "なし"}
+期間: ${project.start_date} 〜 ${project.end_date}
+追加要件: ${project.additional_requirements || "なし"}`;
 }
 
 // ----------------------------------------------------------------------------
 // Section 6: Bedrock API Call (AWS Signature V4)
 // ----------------------------------------------------------------------------
-async function callClaudeForEvaluation(
-  systemPrompt: string,
-  userPrompt: string
-): Promise<Evaluation> {
-  const region = Deno.env.get('AWS_REGION') || 'ap-northeast-1';
-  const accessKeyId = Deno.env.get('AWS_ACCESS_KEY_ID')!;
-  const secretAccessKey = Deno.env.get('AWS_SECRET_ACCESS_KEY')!;
 
-  const endpoint = `https://bedrock-runtime.${region}.amazonaws.com`;
-  const modelId = 'anthropic.claude-3-haiku-20240307-v1:0';
-  const host = `bedrock-runtime.${region}.amazonaws.com`;
-  const canonicalUri = `/model/${modelId.replace(/:/g, '%3A')}/invoke`;
-  const actualPath = `/model/${modelId}/invoke`;
-  const method = 'POST';
-  const service = 'bedrock';
-
-  const body = JSON.stringify({
+async function callClaude(
+  client: BedrockRuntimeClient,
+  messages: Array<{ role: string; content: string }>,
+  systemPrompt: string
+): Promise<string> {
+  const payload = {
     anthropic_version: "bedrock-2023-05-31",
-    max_tokens: 2048,
+    max_tokens: 2000,
+    temperature: 0.7,
     system: systemPrompt,
-    messages: [{ role: 'user', content: userPrompt }]
-  });
-
-  const dateNow = new Date();
-  const amzDate = dateNow.toISOString().replace(/[:-]|\.\d{3}/g, '');
-  const dateStamp = amzDate.substring(0, 8);
-
-  const headers = {
-    'Content-Type': 'application/json',
-    'X-Amz-Date': amzDate,
-    'Host': host,
+    messages: messages,
   };
 
-  async function sign(key: Uint8Array, msg: string): Promise<Uint8Array> {
-    const encoder = new TextEncoder();
-    const keyData = await crypto.subtle.importKey(
-      'raw', key, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
-    );
-    const signature = await crypto.subtle.sign('HMAC', keyData, encoder.encode(msg));
-    return new Uint8Array(signature);
-  }
-
-  async function getSignatureKey(
-    key: string, dateStamp: string, regionName: string, serviceName: string
-  ): Promise<Uint8Array> {
-    const encoder = new TextEncoder();
-    const kDate = await sign(encoder.encode('AWS4' + key), dateStamp);
-    const kRegion = await sign(kDate, regionName);
-    const kService = await sign(kRegion, serviceName);
-    const kSigning = await sign(kService, 'aws4_request');
-    return kSigning;
-  }
-
-  const payloadHash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(body));
-  const payloadHashHex = Array.from(new Uint8Array(payloadHash))
-    .map(b => b.toString(16).padStart(2, '0')).join('');
-
-  const canonicalHeaders = `host:${host}\nx-amz-date:${amzDate}\n`;
-  const signedHeaders = 'host;x-amz-date';
-  const canonicalRequest = `${method}\n${canonicalUri}\n\n${canonicalHeaders}\n${signedHeaders}\n${payloadHashHex}`;
-
-  const algorithm = 'AWS4-HMAC-SHA256';
-  const credentialScope = `${dateStamp}/${region}/${service}/aws4_request`;
-  const canonicalRequestHash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonicalRequest));
-  const canonicalRequestHashHex = Array.from(new Uint8Array(canonicalRequestHash))
-    .map(b => b.toString(16).padStart(2, '0')).join('');
-
-  const stringToSign = `${algorithm}\n${amzDate}\n${credentialScope}\n${canonicalRequestHashHex}`;
-
-  const signingKey = await getSignatureKey(secretAccessKey, dateStamp, region, service);
-  const signature = await sign(signingKey, stringToSign);
-  const signatureHex = Array.from(signature).map(b => b.toString(16).padStart(2, '0')).join('');
-
-  const authorizationHeader = `${algorithm} Credential=${accessKeyId}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signatureHex}`;
-
-  const response = await fetch(`${endpoint}${actualPath}`, {
-    method: 'POST',
-    headers: { ...headers, 'Authorization': authorizationHeader },
-    body: body,
+  const command = new InvokeModelCommand({
+    modelId: "anthropic.claude-3-haiku-20240307-v1:0",
+    body: JSON.stringify(payload),
   });
 
-  if (!response.ok) {
-    const error = await response.text();
-    throw new Error(`Bedrock API error: ${response.status} - ${error}`);
-  }
+  const response = await client.send(command);
+  const responseBody = JSON.parse(new TextDecoder().decode(response.body));
 
-  const result = await response.json();
-  const assistantMessage = result.content[0].text;
-
-  return parseEvaluation(assistantMessage);
+  return responseBody.content[0].text;
 }
 
 // ----------------------------------------------------------------------------
 // Section 7: Evaluation Response Parser
 // ----------------------------------------------------------------------------
-function parseEvaluation(response: string): Evaluation {
-  try {
-    // Extract JSON block
-    const jsonMatch = response.match(/```json\n([\s\S]*?)\n```/) || response.match(/\{[\s\S]*\}/);
-    if (jsonMatch) {
-      const parsed = JSON.parse(jsonMatch[1] || jsonMatch[0]);
-      return parsed;
+
+function parseEvaluationResponse(llmResponse: string): LLMEvaluationResult {
+  const jsonMatch = llmResponse.match(/\{[\s\S]*\}/);
+  
+  if (jsonMatch) {
+    try {
+      return JSON.parse(jsonMatch[0]);
+    } catch (e) {
+      console.error("Failed to parse LLM response:", e);
     }
-    // Not JSON format - treat as question
-    return {
-      ready: false,
-      question: response,
-    };
-  } catch (e) {
-    console.error('JSON parse error:', e);
-    return {
-      ready: false,
-      question: response,
-    };
   }
+  
+  // Fallback
+  return {
+    is_sufficient: false,
+    next_question: "追加情報を教えていただけますか？",
+  };
 }
 
 // ----------------------------------------------------------------------------
 // Section 8: Developer Matching Logic
 // ----------------------------------------------------------------------------
-async function matchDevelopers(supabase: any, requirements: Requirements): Promise<any[]> {
-  // Fetch all active developers with skills
-  const { data: developers, error } = await supabase
-    .from('developers')
-    .select(`
-      *,
-      developer_skills (*)
-    `)
-    .eq('status', 'active')
-    .eq('is_public', true);
 
-  if (error) throw error;
+async function performMatching(
+  supabase: any,
+  projectId: string,
+  projectData: any
+): Promise<Array<{
+  developer_id: string;
+  name: string;
+  match_score: number;
+  matched_skills: string[];
+  reasoning: string;
+}>> {
+  // Get required skills
+  const { data: requiredSkills } = await supabase
+    .from("project_required_skills")
+    .select("*")
+    .eq("project_id", projectId)
+    .eq("is_required", true);
 
-  // Score each developer
-  const matches = developers.map((dev: any) => {
-    const score = calculateMatchScore(dev, requirements);
-    return {
-      developer_id: dev.id,
-      developer_name: dev.name,
-      developer_email: dev.email,
-      match_score: score.total,
-      match_reason: score.reason,
-      skills_matched: score.skillsMatched,
-      skills_not_matched: score.skillsNotMatched,
-    };
-  });
+  if (!requiredSkills || requiredSkills.length === 0) {
+    return [];
+  }
 
-  // Sort by score (descending)
-  matches.sort((a, b) => b.match_score - a.match_score);
+  const requiredSkillNames = requiredSkills.map((s: any) => s.skill_name);
 
-  // Return top 5
-  return matches.slice(0, 5);
+  // Get active developers
+  const { data: developers } = await supabase
+    .from("developers")
+    .select("*, developer_skills(*)")
+    .eq("status", "active")
+    .eq("is_public", true);
+
+  if (!developers || developers.length === 0) {
+    return [];
+  }
+
+  // Calculate match scores
+  const matches = developers
+    .map((dev: any) => calculateMatchScore(dev, requiredSkills, requiredSkillNames))
+    .filter((m: any) => m !== null && m.match_score >= 50)
+    .sort((a: any, b: any) => b.match_score - a.match_score)
+    .slice(0, 10);
+
+  // Save matches to database
+  for (const match of matches) {
+    await supabase.from("matches").insert({
+      project_id: projectId,
+      developer_id: match.developer_id,
+      match_score: match.match_score,
+      status: "suggested",
+    });
+  }
+
+  return matches;
 }
 
 // ----------------------------------------------------------------------------
 // Section 9: Match Score Calculation
 // ----------------------------------------------------------------------------
-function calculateMatchScore(developer: any, requirements: Requirements): any {
-  const requiredSkills = requirements.skills.filter((s: SkillRequirement) => s.required);
-  const optionalSkills = requirements.skills.filter((s: SkillRequirement) => !s.required);
+
+function calculateMatchScore(
+  developer: any,
+  requiredSkills: any[],
+  requiredSkillNames: string[]
+): {
+  developer_id: string;
+  name: string;
+  match_score: number;
+  matched_skills: string[];
+  reasoning: string;
+} | null {
+  const devSkills = developer.developer_skills || [];
+  const devSkillNames = devSkills.map((s: any) => s.skill_name);
+
+  // Find matched skills
+  const matchedSkills = requiredSkillNames.filter((skill: string) =>
+    devSkillNames.includes(skill)
+  );
+
+  // Calculate basic match score
+  const matchScore = (matchedSkills.length / requiredSkillNames.length) * 100;
+
+  // Check skill levels
+  const levels = ["beginner", "intermediate", "advanced", "expert"];
   
-  let totalScore = 0;
-  const skillsMatched: any[] = [];
-  const skillsNotMatched: any[] = [];
-
-  // Skill level mapping
-  const levelMap: any = { beginner: 1, intermediate: 2, advanced: 3, expert: 4 };
-
-  // Check required skills (20 points each)
-  requiredSkills.forEach((reqSkill: SkillRequirement) => {
-    const devSkill = developer.developer_skills.find(
-      (s: any) => s.skill_name === reqSkill.name
+  for (const reqSkill of requiredSkills) {
+    const devSkill = devSkills.find(
+      (ds: any) => ds.skill_name === reqSkill.skill_name
     );
-
+    
     if (devSkill) {
-      const reqLevel = levelMap[reqSkill.level];
-      const devLevel = levelMap[devSkill.skill_level];
-
-      if (devLevel >= reqLevel) {
-        totalScore += 20;
-        skillsMatched.push({
-          name: reqSkill.name,
-          required_level: reqSkill.level,
-          developer_level: devSkill.skill_level,
-          years: devSkill.years,
-          met: true,
-        });
-      } else {
-        skillsNotMatched.push({
-          name: reqSkill.name,
-          required_level: reqSkill.level,
-          developer_level: devSkill.skill_level,
-          met: false,
-        });
-      }
-    } else {
-      skillsNotMatched.push({
-        name: reqSkill.name,
-        required_level: reqSkill.level,
-        developer_level: null,
-        met: false,
-      });
-    }
-  });
-
-  // Check optional skills (10 points each)
-  optionalSkills.forEach((reqSkill: SkillRequirement) => {
-    const devSkill = developer.developer_skills.find(
-      (s: any) => s.skill_name === reqSkill.name
-    );
-
-    if (devSkill) {
-      const reqLevel = levelMap[reqSkill.level];
-      const devLevel = levelMap[devSkill.skill_level];
-
-      if (devLevel >= reqLevel) {
-        totalScore += 10;
-        skillsMatched.push({
-          name: reqSkill.name,
-          required_level: reqSkill.level,
-          developer_level: devSkill.skill_level,
-          years: devSkill.years,
-          met: true,
-        });
+      const reqLevel = levels.indexOf(reqSkill.minimum_level);
+      const devLevel = levels.indexOf(devSkill.skill_level);
+      
+      if (devLevel < reqLevel) {
+        return null; // Developer doesn't meet minimum level
       }
     }
-  });
-
-  // Check start date (20 points)
-  if (requirements.start_date === 'now' && developer.start_date === 'now') {
-    totalScore += 20;
-  } else if (requirements.start_date !== 'now') {
-    // Date comparison (simplified)
-    if (developer.start_date === 'now' || developer.start_date <= requirements.start_date) {
-      totalScore += 20;
-    } else {
-      totalScore += 10;
-    }
-  }
-
-  // Generate match reason
-  let reason = '';
-  if (skillsNotMatched.length === 0) {
-    reason = `全ての必須スキルを満たしています。${skillsMatched.map(s => `${s.name}(${s.developer_level})`).join(', ')}の経験があります。`;
-  } else {
-    reason = `必須スキル不足: ${skillsNotMatched.map(s => s.name).join(', ')}`;
   }
 
   return {
-    total: totalScore,
-    reason: reason,
-    skillsMatched: skillsMatched,
-    skillsNotMatched: skillsNotMatched,
+    developer_id: developer.id,
+    name: developer.name,
+    match_score: Math.round(matchScore),
+    matched_skills: matchedSkills,
+    reasoning: `必須スキル${requiredSkillNames.length}件中${matchedSkills.length}件マッチ`,
   };
 }
 
