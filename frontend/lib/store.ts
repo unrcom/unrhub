@@ -1,28 +1,19 @@
 import { create } from 'zustand';
-import { devtools, persist } from 'zustand/middleware';
+import { devtools, persist, createJSONStorage } from 'zustand/middleware';
 import { ProjectData, ChatMessage, MatchResult } from './types';
 
 interface AppState {
-  // プロジェクトデータ
   projectData: ProjectData;
   setProjectData: (data: ProjectData) => void;
   updateProjectData: (data: Partial<ProjectData>) => void;
-  
-  // チャット履歴
   chatHistory: ChatMessage[];
   addMessage: (message: ChatMessage) => void;
   clearChat: () => void;
-  
-  // マッチング結果
   matchResults: MatchResult[] | null;
   requirements: any | null;
   setMatchResults: (results: MatchResult[], requirements: any) => void;
-  
-  // UI状態
   isLoading: boolean;
   setIsLoading: (loading: boolean) => void;
-  
-  // リセット
   resetAll: () => void;
 }
 
@@ -30,70 +21,48 @@ export const useAppStore = create<AppState>()(
   devtools(
     persist(
       (set) => ({
-        // 初期状態
         projectData: {},
         chatHistory: [],
         matchResults: null,
         requirements: null,
         isLoading: false,
-
-        // アクション
-        setProjectData: (data) => 
-          set({ projectData: data }, false, 'setProjectData'),
         
-        updateProjectData: (data) =>
-          set(
-            (state) => ({ projectData: { ...state.projectData, ...data } }),
-            false,
-            'updateProjectData'
-          ),
+        setProjectData: (data) => set({ projectData: data }),
         
-        addMessage: (message) =>
-          set(
-            (state) => ({
-              chatHistory: [...state.chatHistory, message]
-            }),
-            false,
-            'addMessage'
-          ),
+        updateProjectData: (data) => set((state) => ({ 
+          projectData: { ...state.projectData, ...data } 
+        })),
         
-        clearChat: () =>
-          set({ chatHistory: [] }, false, 'clearChat'),
+        addMessage: (message) => set((state) => ({ 
+          chatHistory: [...state.chatHistory, message] 
+        })),
         
-        setMatchResults: (results, requirements) =>
-          set(
-            { matchResults: results, requirements },
-            false,
-            'setMatchResults'
-          ),
+        clearChat: () => set({ chatHistory: [] }),
         
-        setIsLoading: (loading) =>
-          set({ isLoading: loading }, false, 'setIsLoading'),
+        setMatchResults: (results, requirements) => set({ 
+          matchResults: results, 
+          requirements 
+        }),
         
-        resetAll: () =>
-          set(
-            {
-              projectData: {},
-              chatHistory: [],
-              matchResults: null,
-              requirements: null,
-              isLoading: false,
-            },
-            false,
-            'resetAll'
-          ),
+        setIsLoading: (loading) => set({ isLoading: loading }),
+        
+        resetAll: () => set({ 
+          projectData: {}, 
+          chatHistory: [], 
+          matchResults: null, 
+          requirements: null, 
+          isLoading: false 
+        }),
       }),
       {
-        name: 'developer-matching-storage',
+        name: 'unrhub-matching-storage',
+        storage: createJSONStorage(() => sessionStorage),
         partialize: (state) => ({
           projectData: state.projectData,
           chatHistory: state.chatHistory,
         }),
       }
     ),
-    {
-      name: 'DeveloperMatching',
-      enabled: process.env.NODE_ENV === 'development',
-    }
+    { name: 'UnrhubMatching' }
   )
 );
