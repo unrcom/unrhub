@@ -9,10 +9,6 @@
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
-import {
-  BedrockRuntimeClient,
-  InvokeModelCommand,
-} from "https://esm.sh/@aws-sdk/client-bedrock-runtime@3.451.0";
 
 interface SkillRequirement {
   skill_name: string;
@@ -100,26 +96,18 @@ serve(async (req) => {
     // Parse request
     const payload: RequestPayload = await req.json();
 
-    // Initialize clients
+    // Initialize Supabase client
     const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
     const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
     const supabase = createClient(supabaseUrl, supabaseKey);
-
-    const bedrockClient = new BedrockRuntimeClient({
-      region: Deno.env.get("AWS_REGION") || "ap-northeast-1",
-      credentials: {
-        accessKeyId: Deno.env.get("AWS_ACCESS_KEY_ID")!,
-        secretAccessKey: Deno.env.get("AWS_SECRET_ACCESS_KEY")!,
-      },
-    });
 
     let response: ResponsePayload;
 
     // Route to appropriate handler
     if (isInitialRequest(payload)) {
-      response = await handleInitialRequest(payload, supabase, bedrockClient);
+      response = await handleInitialRequest(payload, supabase);
     } else if (isChatRequest(payload)) {
-      response = await handleChatRequest(payload, supabase, bedrockClient);
+      response = await handleChatRequest(payload, supabase);
     } else {
       throw new Error("Invalid request format");
     }
@@ -146,8 +134,7 @@ function isChatRequest(payload: any): payload is ChatRequest {
 
 async function handleInitialRequest(
   payload: InitialRequest,
-  supabase: any,
-  bedrockClient: BedrockRuntimeClient
+  supabase: any
 ): Promise<ResponsePayload> {
   console.log("Processing initial request");
   const { project } = payload;
@@ -186,7 +173,7 @@ async function handleInitialRequest(
   const systemPrompt = buildSystemPrompt();
   const userPrompt = buildInitialUserPrompt(project);
 
-  const llmResponse = await callClaude(bedrockClient, [
+  const llmResponse = await callClaude([
     { role: "user", content: userPrompt },
   ], systemPrompt);
 
@@ -225,8 +212,7 @@ async function handleInitialRequest(
 
 async function handleChatRequest(
   payload: ChatRequest,
-  supabase: any,
-  bedrockClient: BedrockRuntimeClient
+  supabase: any
 ): Promise<ResponsePayload> {
   console.log("Processing chat request");
   const { project_id, message } = payload;
@@ -264,7 +250,7 @@ async function handleChatRequest(
   }));
   messages.push({ role: "user", content: message });
 
-  const llmResponse = await callClaude(bedrockClient, messages, systemPrompt);
+  const llmResponse = await callClaude(messages, systemPrompt);
   console.log("LLM Response:", llmResponse);
 
   const evaluation = parseEvaluationResponse(llmResponse);
@@ -354,31 +340,42 @@ function buildInitialUserPrompt(project: ProjectInput): string {
 }
 
 // ----------------------------------------------------------------------------
-// Section 6: Bedrock API Call (AWS Signature V4)
+// Section 6: Anthropic API Direct Call
 // ----------------------------------------------------------------------------
 
 async function callClaude(
-  client: BedrockRuntimeClient,
   messages: Array<{ role: string; content: string }>,
   systemPrompt: string
 ): Promise<string> {
-  const payload = {
-    anthropic_version: "bedrock-2023-05-31",
-    max_tokens: 2000,
-    temperature: 0.7,
-    system: systemPrompt,
-    messages: messages,
-  };
+  const apiKey = Deno.env.get("ANTHROPIC_API_KEY");
+  
+  if (!apiKey) {
+    throw new Error("ANTHROPIC_API_KEY not found in environment variables");
+  }
 
-  const command = new InvokeModelCommand({
-    modelId: "anthropic.claude-3-haiku-20240307-v1:0",
-    body: JSON.stringify(payload),
+  const response = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01"
+    },
+    body: JSON.stringify({
+      model: "claude-3-haiku-20240307",
+      max_tokens: 2000,
+      temperature: 0.7,
+      system: systemPrompt,
+      messages: messages
+    })
   });
 
-  const response = await client.send(command);
-  const responseBody = JSON.parse(new TextDecoder().decode(response.body));
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(`Anthropic API error: ${response.status} ${error}`);
+  }
 
-  return responseBody.content[0].text;
+  const data = await response.json();
+  return data.content[0].text;
 }
 
 // ----------------------------------------------------------------------------
