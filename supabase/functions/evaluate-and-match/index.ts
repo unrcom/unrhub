@@ -37,7 +37,12 @@ interface ChatRequest {
   message: string;
 }
 
-type RequestPayload = InitialRequest | ChatRequest;
+interface EmailSubmissionRequest {
+  project_id: string;
+  email: string;
+}
+
+type RequestPayload = InitialRequest | ChatRequest | EmailSubmissionRequest;
 
 interface QuestionResponse {
   project_id: string;
@@ -57,7 +62,23 @@ interface MatchResponse {
   }>;
 }
 
-type ResponsePayload = QuestionResponse | MatchResponse;
+interface EmailRequiredResponse {
+  project_id: string;
+  type: "email_required";
+  summary: {
+    total_active_developers: number;
+    required_skills: string[];
+    message: string;
+  };
+}
+
+interface ConfirmationResponse {
+  project_id: string;
+  type: "confirmation";
+  message: string;
+}
+
+type ResponsePayload = QuestionResponse | MatchResponse | EmailRequiredResponse | ConfirmationResponse;
 
 interface LLMEvaluationResult {
   is_sufficient: boolean;
@@ -106,6 +127,8 @@ serve(async (req) => {
     // Route to appropriate handler
     if (isInitialRequest(payload)) {
       response = await handleInitialRequest(payload, supabase);
+    } else if (isEmailSubmissionRequest(payload)) {
+      response = await handleEmailSubmission(payload, supabase);
     } else if (isChatRequest(payload)) {
       response = await handleChatRequest(payload, supabase);
     } else {
@@ -129,7 +152,11 @@ function isInitialRequest(payload: any): payload is InitialRequest {
 }
 
 function isChatRequest(payload: any): payload is ChatRequest {
-  return payload.project_id && payload.message;
+  return payload.project_id && payload.message && !payload.email;
+}
+
+function isEmailSubmissionRequest(payload: any): payload is EmailSubmissionRequest {
+  return payload.project_id && payload.email;
 }
 
 async function handleInitialRequest(
@@ -149,6 +176,7 @@ async function handleInitialRequest(
       start_date: project.start_date,
       end_date: project.end_date,
       status: "draft",
+      matching_status: "client_info_collecting",
     })
     .select()
     .single();
@@ -202,11 +230,7 @@ async function handleInitialRequest(
     };
   } else {
     const matches = await performMatching(supabase, projectId, project);
-    return {
-      project_id: projectId,
-      type: "matches",
-      matches,
-    };
+    return matches;
   }
 }
 
@@ -269,12 +293,60 @@ async function handleChatRequest(
     };
   } else {
     const matches = await performMatching(supabase, project_id, projectData);
-    return {
-      project_id: project_id,
-      type: "matches",
-      matches,
-    };
+    return matches;
   }
+}
+
+async function handleEmailSubmission(
+  payload: EmailSubmissionRequest,
+  supabase: any
+): Promise<ResponsePayload> {
+  console.log("Processing email submission");
+  const { project_id, email } = payload;
+
+  // Update or create client
+  const { data: clientData, error: clientError } = await supabase
+    .from("clients")
+    .insert({
+      email: email,
+      contact_name: "未登録",
+    })
+    .select()
+    .single();
+
+  if (clientError && clientError.code !== "23505") { // 23505 = unique violation
+    throw new Error(`Failed to create client: ${clientError.message}`);
+  }
+
+  // If unique violation, get existing client
+  let clientId = clientData?.id;
+  if (clientError && clientError.code === "23505") {
+    const { data: existingClient } = await supabase
+      .from("clients")
+      .select("id")
+      .eq("email", email)
+      .single();
+    clientId = existingClient?.id;
+  }
+
+  // Update project with client_id and matching_status
+  const { error: updateError } = await supabase
+    .from("projects")
+    .update({
+      client_id: clientId,
+      matching_status: "email_received",
+    })
+    .eq("id", project_id);
+
+  if (updateError) {
+    throw new Error(`Failed to update project: ${updateError.message}`);
+  }
+
+  return {
+    project_id: project_id,
+    type: "confirmation",
+    message: "メールアドレスを受け付けました。後日、弊社スタッフよりご連絡いたします。",
+  };
 }
 
 async function saveSkills(
@@ -408,13 +480,7 @@ async function performMatching(
   supabase: any,
   projectId: string,
   projectData: any
-): Promise<Array<{
-  developer_id: string;
-  name: string;
-  match_score: number;
-  matched_skills: string[];
-  reasoning: string;
-}>> {
+): Promise<MatchResponse | EmailRequiredResponse> {
   // Get required skills
   const { data: requiredSkills } = await supabase
     .from("project_required_skills")
@@ -423,7 +489,11 @@ async function performMatching(
     .eq("is_required", true);
 
   if (!requiredSkills || requiredSkills.length === 0) {
-    return [];
+    return {
+      project_id: projectId,
+      type: "matches",
+      matches: [],
+    };
   }
 
   const requiredSkillNames = requiredSkills.map((s: any) => s.skill_name);
@@ -435,8 +505,26 @@ async function performMatching(
     .eq("status", "active")
     .eq("is_public", true);
 
+  const totalActiveDevelopers = developers?.length || 0;
+
   if (!developers || developers.length === 0) {
-    return [];
+    // Update matching_status to awaiting_email
+    await supabase
+      .from("projects")
+      .update({ matching_status: "awaiting_email" })
+      .eq("id", projectId);
+
+    return {
+      project_id: projectId,
+      type: "email_required",
+      summary: {
+        total_active_developers: 0,
+        required_skills: requiredSkills.map((s: any) => 
+          `${s.skill_name}(${s.minimum_level})`
+        ),
+        message: "条件に合う技術者が登録されていません。弊社スタッフにてご希望に沿う技術者を確認いたします。ご連絡先のメールアドレスを頂けましたら、後日回答させていただきます。",
+      },
+    };
   }
 
   // Calculate match scores
@@ -445,6 +533,32 @@ async function performMatching(
     .filter((m: any) => m !== null && m.match_score >= 50)
     .sort((a: any, b: any) => b.match_score - a.match_score)
     .slice(0, 10);
+
+  if (matches.length === 0) {
+    // Update matching_status to awaiting_email
+    await supabase
+      .from("projects")
+      .update({ matching_status: "awaiting_email" })
+      .eq("id", projectId);
+
+    return {
+      project_id: projectId,
+      type: "email_required",
+      summary: {
+        total_active_developers: totalActiveDevelopers,
+        required_skills: requiredSkills.map((s: any) => 
+          `${s.skill_name}(${s.minimum_level})`
+        ),
+        message: "条件に合う技術者が登録されていません。弊社スタッフにてご希望に沿う技術者を確認いたします。ご連絡先のメールアドレスを頂けましたら、後日回答させていただきます。",
+      },
+    };
+  }
+
+  // Update matching_status to developers_matched
+  await supabase
+    .from("projects")
+    .update({ matching_status: "developers_matched" })
+    .eq("id", projectId);
 
   // Save matches to database
   for (const match of matches) {
@@ -456,7 +570,11 @@ async function performMatching(
     });
   }
 
-  return matches;
+  return {
+    project_id: projectId,
+    type: "matches",
+    matches,
+  };
 }
 
 // ----------------------------------------------------------------------------

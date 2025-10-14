@@ -500,3 +500,7 @@ GRANT SELECT, INSERT ON TABLE projects TO anon;
 GRANT SELECT, INSERT ON TABLE project_required_skills TO anon;
 GRANT SELECT, INSERT ON TABLE project_chat_history TO anon;
 GRANT SELECT ON TABLE matches TO anon;
+
+GRANT ALL ON TABLE clients TO service_role;
+GRANT ALL ON TABLE clients TO authenticated;
+GRANT INSERT, SELECT ON TABLE clients TO anon;
